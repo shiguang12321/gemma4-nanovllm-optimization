@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+
+# Virtual environments and local machine state
+.env
+.env.*
+.venv/
+venv/
+env/
+.vscode/
+.idea/
+
+# Python/tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+build/
+dist/
+*.egg-info/
+
+# Generated logs and packaged artifacts
+*.log
+*.zip
+
+# Local model weights and runtime artifacts
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+*.engine
+*.bin
