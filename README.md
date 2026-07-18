@@ -239,8 +239,6 @@ gsm8k strict-match exact_match    = 0.7475
 | 10 | 248.51 tok/s | 135.40 tok/s | **1.84 倍** |
 | 1 | 52.35 tok/s | 15.90 tok/s | **3.29 倍** |
 
-以上结果只表示相同并发下的 CUDA Graph 加速效果，不比较并发 10 与并发 1。
-
 ## 项目结构
 
 ```text
