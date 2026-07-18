@@ -97,25 +97,16 @@ gsm8k strict-match exact_match    = 0.7475
 
 ## Performance Benchmark
 
-The measured throughput result below used this fixed benchmark configuration:
+CUDA Graph speedup was measured against `--enforce-eager` at the same
+concurrency. All other optimizations remained enabled.
 
-```text
-concurrency = 10
-input_len = 1024
-output_len = 100
-variance = 0.5
-shared_prefix_len = 256
-num_requests = 300
-```
+| Concurrency | CUDA Graph | Eager | CUDA Graph speedup |
+|-------------|------------|-------|--------------------|
+| 10 | 248.51 tok/s | 135.40 tok/s | **1.84x** |
+| 1 | 52.35 tok/s | 15.90 tok/s | **3.29x** |
 
-Local benchmark result:
-
-```text
-elapsed_s = 163.75
-generated_tokens = 29812
-throughput_tok_s = 182.05
-end_to_end_tok_s = 2018.55
-```
+These figures describe CUDA Graph speedup at the same concurrency; they do not
+compare concurrency 10 with concurrency 1.
 
 ## Project Structure
 
@@ -240,25 +231,15 @@ gsm8k strict-match exact_match    = 0.7475
 
 ## 性能基准
 
-以下吞吐结果使用固定基准配置获得：
+在相同并发下，将开启 CUDA Graph 的结果与 `--enforce-eager` 结果进行比较；
+其他优化均保持开启。
 
-```text
-concurrency = 10
-input_len = 1024
-output_len = 100
-variance = 0.5
-shared_prefix_len = 256
-num_requests = 300
-```
+| 并发数 | CUDA Graph | Eager | CUDA Graph 加速比 |
+|--------|------------|-------|-------------------|
+| 10 | 248.51 tok/s | 135.40 tok/s | **1.84 倍** |
+| 1 | 52.35 tok/s | 15.90 tok/s | **3.29 倍** |
 
-本地基准结果：
-
-```text
-elapsed_s = 163.75
-generated_tokens = 29812
-throughput_tok_s = 182.05
-end_to_end_tok_s = 2018.55
-```
+以上结果只表示相同并发下的 CUDA Graph 加速效果，不比较并发 10 与并发 1。
 
 ## 项目结构
 
