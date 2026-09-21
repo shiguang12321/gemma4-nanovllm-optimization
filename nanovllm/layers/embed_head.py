@@ -6,7 +6,7 @@ import torch.distributed as dist
 from nanovllm.utils.context import get_context
 
 
-class VocabParallelEmbedding(nn.Module):
+class VocabParallelEmbedding(nn.Module):  #token——>向量
 
     def __init__(
         self,
@@ -24,14 +24,14 @@ class VocabParallelEmbedding(nn.Module):
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim))
         self.weight.weight_loader = self.weight_loader
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):#加载权重
         param_data = param.data
         shard_size = param_data.size(0)
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor):#前向传播
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
@@ -42,7 +42,7 @@ class VocabParallelEmbedding(nn.Module):
         return y
 
 
-class ParallelLMHead(VocabParallelEmbedding):
+class ParallelLMHead(VocabParallelEmbedding):  #向量——>logits
 
     def __init__(
         self,
@@ -53,7 +53,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor):#前向传播
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1

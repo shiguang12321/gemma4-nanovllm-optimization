@@ -6,8 +6,19 @@ import triton.language as tl
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.rotary_embedding import apply_rotary_emb
+from nanovllm.layers.gemma4_elementwise import (
+    gelu_tanh_mul,
+    moe_post_norm_add_scalar,
+    post_norm_add_next_norm,
+    post_norm_add_scalar,
+    qkv_norm_rope,
+    rms_norm,
+    router_norm_scale,
+    run_elementwise,
+)
 from nanovllm.utils.context import get_context
 
+MOE_TRITON_DECODE_MAX_TOKENS = 16
 TRITON_MOE_GATE_BLOCK_M = 64
 TRITON_MOE_GATE_BLOCK_K = 128
 TRITON_MOE_DOWN_BLOCK_H = 32
@@ -272,18 +283,18 @@ def gemma4_moe_decode_triton(
     )
     return out
 class Gemma4RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True):
+    def __init__(self, dim: int, eps: float = 1e-6, with_scale: bool = True, enable_fused_elementwise: bool = False):
         super().__init__()
         self.eps = eps
         self.with_scale = with_scale
+        self.enable_fused_elementwise = enable_fused_elementwise
         if with_scale:
             self.weight = nn.Parameter(torch.ones(dim))
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = x.float()
-        y = y * torch.pow(y.pow(2).mean(-1, keepdim=True) + self.eps, -0.5)
-        if self.with_scale:
-            y = y * self.weight.float()
-        return y.to(x.dtype)
+        return run_elementwise(
+            rms_norm, x, self.weight if self.with_scale else None, self.eps,
+            enabled=self.enable_fused_elementwise,
+        )
 class Gemma4ScaledEmbedding(VocabParallelEmbedding):
     def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx: int | None = None):
         super().__init__(num_embeddings, embedding_dim)
@@ -314,9 +325,12 @@ class Gemma4RotaryEmbedding(nn.Module):
             freqs = torch.einsum("i,j->ij", positions, inv_freq)
             self.register_buffer(f"{layer_type}_cos", freqs.cos(), persistent=False)
             self.register_buffer(f"{layer_type}_sin", freqs.sin(), persistent=False)
-    def forward(self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor, layer_type: str):
+    def get_cos_sin(self, positions: torch.Tensor, layer_type: str):
         cos = getattr(self, f"{layer_type}_cos")[positions].unsqueeze(1)
         sin = getattr(self, f"{layer_type}_sin")[positions].unsqueeze(1)
+        return cos, sin
+    def forward(self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor, layer_type: str, cos_sin=None):
+        cos, sin = self.get_cos_sin(positions, layer_type) if cos_sin is None else cos_sin
         return apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
 class Gemma4Attention(nn.Module):
     def __init__(self, config, layer_idx: int, rotary_emb: Gemma4RotaryEmbedding):
@@ -330,25 +344,38 @@ class Gemma4Attention(nn.Module):
         if self.num_kv_heads is None:
             self.num_kv_heads = config.num_key_value_heads
         self.rotary_emb = rotary_emb
+        self.enable_fused_elementwise = getattr(config, "enable_fused_elementwise", False)
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = None if self.use_alt else nn.Linear(
             config.hidden_size, self.num_kv_heads * self.head_dim, bias=config.attention_bias
         )
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
-        self.q_norm = Gemma4RMSNorm(self.head_dim, config.rms_norm_eps)
-        self.k_norm = Gemma4RMSNorm(self.head_dim, config.rms_norm_eps)
-        self.v_norm = Gemma4RMSNorm(self.head_dim, config.rms_norm_eps, with_scale=False)
+        self.q_norm = Gemma4RMSNorm(self.head_dim, config.rms_norm_eps, enable_fused_elementwise=self.enable_fused_elementwise)
+        self.k_norm = Gemma4RMSNorm(self.head_dim, config.rms_norm_eps, enable_fused_elementwise=self.enable_fused_elementwise)
+        self.v_norm = Gemma4RMSNorm(self.head_dim, config.rms_norm_eps, with_scale=False, enable_fused_elementwise=self.enable_fused_elementwise)
         window = config.sliding_window if self.is_sliding else None
-        self.attn = Attention(self.num_heads, self.head_dim, 1.0, self.num_kv_heads, window)
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.attn = Attention(
+            self.num_heads, self.head_dim, 1.0, self.num_kv_heads, window,
+            attn_decode_impl=getattr(config, "attn_decode_impl", "splitk"),
+            enable_cascade_decode=getattr(config, "enable_cascade_decode", False),
+        )
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, cos_sin=None) -> torch.Tensor:
         q = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
         k = self.k_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
         v = k if self.v_proj is None else self.v_proj(hidden_states).view(-1, self.num_kv_heads, self.head_dim)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k, self.layer_type)
-        v = self.v_norm(v)
+        if cos_sin is None:
+            cos_sin = self.rotary_emb.get_cos_sin(positions, self.layer_type)
+        if self.enable_fused_elementwise:
+            q, k, v = run_elementwise(
+                qkv_norm_rope, q, k, v, self.q_norm.weight, self.k_norm.weight,
+                *cos_sin, self.q_norm.eps, enabled=True,
+            )
+        else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            q, k = self.rotary_emb(positions, q, k, self.layer_type, cos_sin)
+            v = self.v_norm(v)
         o = self.attn(q, k, v)
         return self.o_proj(o.flatten(1, -1))
 class Gemma4MLP(nn.Module):
@@ -356,22 +383,32 @@ class Gemma4MLP(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
         intermediate_size = config.intermediate_size
+        self.enable_fused_elementwise = getattr(config, "enable_fused_elementwise", False)
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(gelu_tanh(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(run_elementwise(
+            gelu_tanh_mul, self.gate_proj(x), self.up_proj(x), enabled=self.enable_fused_elementwise,
+        ))
 class Gemma4Experts(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
         self.intermediate_dim = config.moe_intermediate_size
         self.hidden_dim = config.hidden_size
+        self.moe_impl = getattr(config, "moe_impl", "auto")
+        self.enable_fused_elementwise = getattr(config, "enable_fused_elementwise", False)
         self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
     def forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor):
         context = get_context()
-        if not context.is_prefill and hidden_states.size(0) <= 16:
+        if self.moe_impl == "grouped":
+            from nanovllm.layers.grouped_moe import grouped_moe
+            return grouped_moe(
+                hidden_states, top_k_index, top_k_weights, self.gate_up_proj, self.down_proj,
+            )
+        if not context.is_prefill and hidden_states.size(0) <= MOE_TRITON_DECODE_MAX_TOKENS:
             return self.forward_decode(hidden_states, top_k_index, top_k_weights)
         final_hidden_states = torch.zeros_like(hidden_states)
         top_k = top_k_index.size(1)
@@ -390,7 +427,9 @@ class Gemma4Experts(nn.Module):
             expert_idx = expert_idx.item()
             current_state = hidden_states[tokens]
             gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = gelu_tanh(gate) * up
+            current_hidden_states = run_elementwise(
+                gelu_tanh_mul, gate, up, enabled=self.enable_fused_elementwise,
+            )
             current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
             current_hidden_states = current_hidden_states * top_k_weights[tokens, positions, None]
             final_hidden_states.index_add_(0, tokens, current_hidden_states.to(final_hidden_states.dtype))
@@ -411,7 +450,9 @@ class Gemma4Experts(nn.Module):
             gate_up_weight = torch.index_select(self.gate_up_proj, 0, expert_ids)
             gate_up = torch.bmm(gate_up_weight, hidden_states.unsqueeze(-1)).squeeze(-1)
             gate, up = gate_up.chunk(2, dim=-1)
-            current_hidden_states = gelu_tanh(gate) * up
+            current_hidden_states = run_elementwise(
+                gelu_tanh_mul, gate, up, enabled=self.enable_fused_elementwise,
+            )
             down_weight = torch.index_select(self.down_proj, 0, expert_ids)
             current_hidden_states = torch.bmm(down_weight, current_hidden_states.unsqueeze(-1)).squeeze(-1)
             current_hidden_states = current_hidden_states * top_k_weights[:, pos, None]
@@ -421,15 +462,22 @@ class Gemma4Router(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, with_scale=False)
+        self.enable_fused_elementwise = getattr(config, "enable_fused_elementwise", False)
+        self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps, with_scale=False, enable_fused_elementwise=self.enable_fused_elementwise)
         self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.scale = nn.Parameter(torch.ones(config.hidden_size))
         self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
         self.scalar_root_size = config.hidden_size ** -0.5
     def forward(self, hidden_states: torch.Tensor):
         context = get_context()
-        hidden_states = self.norm(hidden_states)
-        hidden_states = hidden_states * self.scale * self.scalar_root_size
+        if self.enable_fused_elementwise:
+            hidden_states = run_elementwise(
+                router_norm_scale, hidden_states, self.scale, self.scalar_root_size,
+                self.norm.eps, enabled=True,
+            )
+        else:
+            hidden_states = self.norm(hidden_states)
+            hidden_states = hidden_states * self.scale * self.scalar_root_size
         logits = self.proj(hidden_states)
         if (
             not context.is_prefill
@@ -446,36 +494,59 @@ class Gemma4Router(nn.Module):
 class Gemma4DecoderLayer(nn.Module):
     def __init__(self, config, layer_idx: int, rotary_emb: Gemma4RotaryEmbedding):
         super().__init__()
+        self.enable_fused_elementwise = getattr(config, "enable_fused_elementwise", False)
+        norm_options = {"eps": config.rms_norm_eps, "enable_fused_elementwise": self.enable_fused_elementwise}
         self.self_attn = Gemma4Attention(config, layer_idx, rotary_emb)
         self.mlp = Gemma4MLP(config, layer_idx)
-        self.input_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pre_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Gemma4RMSNorm(config.hidden_size, **norm_options)
+        self.post_attention_layernorm = Gemma4RMSNorm(config.hidden_size, **norm_options)
+        self.pre_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, **norm_options)
+        self.post_feedforward_layernorm = Gemma4RMSNorm(config.hidden_size, **norm_options)
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
         self.enable_moe_block = config.enable_moe_block
         if self.enable_moe_block:
             self.router = Gemma4Router(config)
             self.experts = Gemma4Experts(config)
-            self.post_feedforward_layernorm_1 = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.post_feedforward_layernorm_2 = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.pre_feedforward_layernorm_2 = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+            self.post_feedforward_layernorm_1 = Gemma4RMSNorm(config.hidden_size, **norm_options)
+            self.post_feedforward_layernorm_2 = Gemma4RMSNorm(config.hidden_size, **norm_options)
+            self.pre_feedforward_layernorm_2 = Gemma4RMSNorm(config.hidden_size, **norm_options)
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, cos_sin=None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states, cos_sin)
+        if self.enable_fused_elementwise:
+            hidden_states, residual = run_elementwise(
+                post_norm_add_next_norm, hidden_states, residual,
+                self.post_attention_layernorm.weight, self.pre_feedforward_layernorm.weight,
+                self.post_attention_layernorm.eps, enabled=True,
+            )
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         if self.enable_moe_block:
-            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+            if not self.enable_fused_elementwise:
+                hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
             top_k_weights, top_k_index = self.router(residual)
             hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
             hidden_states_2 = self.experts(hidden_states_2, top_k_index, top_k_weights)
+            if self.enable_fused_elementwise:
+                return run_elementwise(
+                    moe_post_norm_add_scalar, hidden_states, hidden_states_2, residual,
+                    self.post_feedforward_layernorm_1.weight, self.post_feedforward_layernorm_2.weight,
+                    self.post_feedforward_layernorm.weight, self.layer_scalar,
+                    self.post_feedforward_layernorm.eps, enabled=True,
+                )
             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
             hidden_states = hidden_states_1 + hidden_states_2
+        if self.enable_fused_elementwise:
+            return run_elementwise(
+                post_norm_add_scalar, hidden_states, residual,
+                self.post_feedforward_layernorm.weight, self.layer_scalar,
+                self.post_feedforward_layernorm.eps, enabled=True,
+            )
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states * self.layer_scalar
@@ -485,11 +556,21 @@ class Gemma4Model(nn.Module):
         self.embed_tokens = Gemma4ScaledEmbedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.rotary_emb = Gemma4RotaryEmbedding(config)
         self.layers = nn.ModuleList([Gemma4DecoderLayer(config, i, self.rotary_emb) for i in range(config.num_hidden_layers)])
-        self.norm = Gemma4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layer_types = tuple(dict.fromkeys(config.layer_types))
+        self.norm = Gemma4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps,
+            enable_fused_elementwise=getattr(config, "enable_fused_elementwise", False),
+        )
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
+        # Positions are shared by all layers. Gather once per attention type;
+        # full/sliding attention can have different rotary head dimensions.
+        cos_sin_by_type = {
+            layer_type: self.rotary_emb.get_cos_sin(positions, layer_type)
+            for layer_type in self.layer_types
+        }
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
+            hidden_states = layer(positions, hidden_states, cos_sin_by_type[layer.self_attn.layer_type])
         return self.norm(hidden_states)
 class Gemma4ForCausalLM(nn.Module):
     def __init__(self, config) -> None:

@@ -34,7 +34,7 @@ class LinearBase(nn.Module):
         raise NotImplementedError
 
 
-class ReplicatedLinear(LinearBase):
+class ReplicatedLinear(LinearBase): #每张卡存完整W，各自算完整y，不通信。适合很小，不值得切分。
 
     def __init__(
         self,
@@ -44,14 +44,14 @@ class ReplicatedLinear(LinearBase):
     ):
         super().__init__(input_size, output_size, bias)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):#加载权重
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:#前向传播
         return F.linear(x, self.weight, self.bias)
 
 
-class ColumnParallelLinear(LinearBase):
+class ColumnParallelLinear(LinearBase): #沿输出维度切开，各张卡存一部分W，各自算一部分y，最后通信归并。适合大模型。
 
     def __init__(
         self,
@@ -73,7 +73,7 @@ class ColumnParallelLinear(LinearBase):
         return F.linear(x, self.weight, self.bias)
 
 
-class MergedColumnParallelLinear(ColumnParallelLinear):
+class MergedColumnParallelLinear(ColumnParallelLinear): #合并多个ColumnParallelLinear，适合大模型。
 
     def __init__(
         self,
@@ -93,7 +93,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
-class QKVParallelLinear(ColumnParallelLinear):
+class QKVParallelLinear(ColumnParallelLinear): #QKV并行，适合大模型。
 
     def __init__(
         self,
@@ -128,7 +128,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
-class RowParallelLinear(LinearBase):
+class RowParallelLinear(LinearBase): #沿输入维度切开，各张卡存一部分W，各自算一部分y，最后通信归并。适合大模型。
 
     def __init__(
         self,
@@ -139,7 +139,7 @@ class RowParallelLinear(LinearBase):
         tp_size = dist.get_world_size()
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):#加载权重
         param_data = param.data
         if param_data.ndim == 1:
             param_data.copy_(loaded_weight)

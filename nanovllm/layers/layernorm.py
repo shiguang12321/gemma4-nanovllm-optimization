@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 
-class RMSNorm(nn.Module):
+class RMSNorm(nn.Module): #实验证明RMSNorm比LayerNorm效果更好
 
     def __init__(
         self,
@@ -25,7 +25,7 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
-    @torch.compile
+    @torch.compile  #残差和Norm融在一起计算
     def add_rms_forward(
         self,
         x: torch.Tensor,

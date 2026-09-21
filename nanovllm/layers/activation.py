@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 
 
-class SiluAndMul(nn.Module):
+class SiluAndMul(nn.Module): #实现 SwiGLU 激活
 
     @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:

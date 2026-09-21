@@ -15,12 +15,31 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    graph_block_buckets: list[int] | None = None
+    enable_fused_elementwise: bool = False
+    attn_decode_impl: str = "splitk"
+    moe_impl: str = "auto"
+    enable_cascade_decode: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):
+        from nanovllm.engine.decode_plan import parse_graph_block_buckets
+
+        for name in ("max_num_batched_tokens", "max_num_seqs", "max_model_len", "kvcache_block_size"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.attn_decode_impl not in ("splitk", "splitk_gqa"):
+            raise ValueError("attn_decode_impl must be 'splitk' or 'splitk_gqa'")
+        if self.moe_impl not in ("auto", "grouped"):
+            raise ValueError("moe_impl must be 'auto' or 'grouped'")
+        for name in ("enable_fused_elementwise", "enable_cascade_decode"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a bool")
+        parse_graph_block_buckets(1, self.graph_block_buckets)
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert self.tensor_parallel_size == 1
@@ -30,6 +49,8 @@ class Config:
         self.hf_config = hf_config
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         self.hf_config.max_position_embeddings = self.max_model_len
+        for name in ("enable_fused_elementwise", "attn_decode_impl", "moe_impl", "enable_cascade_decode"):
+            setattr(self.hf_config, name, getattr(self, name))
 
     def load_hf_config(self):
         try:
